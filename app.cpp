@@ -22,10 +22,12 @@
 #define T_START     10      // MIN 5 ns
 #define T_STOP      10      // MIN 5 ns
 #define T_BIT       60     // 10 to 100 ns
-#define T_ZERO      15      // 0.175 to 0.375 T_BIT (typ 0.25)
-#define T_ONE       45      // 0.625 to 0.825 T_BIT (typ 0.75)
-#define T_TAKEOVER  25      // 0 to 0.5 T_BIT
+#define T_ZERO      (T_BIT * .25)      // 0.175 to 0.375 T_BIT (typ 0.25)
+#define T_ONE       (T_BIT * .75)      // 0.625 to 0.825 T_BIT (typ 0.75)
+#define T_TAKEOVER  (T_BIT * .25)      // 0 to 0.5 T_BIT
 #define T_PROG      20      // MIN 20 ms
+#define WRITE_EN    (uint16_t) 0b0000100000000000 // Turns on bit 11
+#define CHRG_PMP    (uint16_t) 0b0000110000000011 // Turns on bit 11 rest as read
 
 /*
  * Set pins according to your wiring scheme
@@ -64,7 +66,6 @@ void handover(void) {
     digitalWrite(DATA_PIN, LOW);
     delayMicroseconds(T_ZERO * 2);
     pinMode(DATA_PIN, INPUT);
-    delayMicroseconds(T_ZERO);
 }
 
 void takeover(void) {
@@ -89,7 +90,7 @@ void sendOne() {
 }
 
 void writeValue(byte value) {
-    for (byte mask = 0x8000; mask; mask >>= 1) {
+    for (byte mask = 0x80; mask; mask >>= 1) {
         if (mask & value)
             sendOne();
         else
@@ -98,7 +99,7 @@ void writeValue(byte value) {
 }
 
 void writeValueBig(uint16_t value) {
-    for (byte mask = 0x80; mask; mask >>= 1) {
+for (uint16_t mask = 0x8000; mask; mask >>= 1) {
         if (mask & value)
             sendOne();
         else
@@ -108,10 +109,18 @@ void writeValueBig(uint16_t value) {
 
 uint16_t readValue() {
     uint16_t result = 0;
+    unsigned long t;
     for (int i = 15; i >= 0; i--) {
-        delayMicroseconds(T_BIT / 2);
-        result |= digitalRead(DATA_PIN) << i;
-        delayMicroseconds(T_BIT / 2);
+        while (digitalRead(DATA_PIN) == 0){}
+        t = micros();
+        while (digitalRead(DATA_PIN) == 1){}
+        t = micros() - t;
+        if (t > T_BIT * .4){
+           result |= 1 << i;
+        }
+        else {
+          result |= 0 << i;
+        } 
     }
     return result;
 }
@@ -122,7 +131,7 @@ uint16_t readCommand(byte command) {
     handover();
     uint16_t result = readValue();
     takeover();
-    startCondition();
+    stopCondition();
     return result;
 }
 
@@ -132,12 +141,7 @@ void startCommandMode() {
     digitalWrite(VDD_PIN, HIGH);
     digitalWrite(DATA_PIN, HIGH);
     delay(T_TURN_ON);
-    startCondition();
-    writeValue(0x94);
-    writeValue(0x16);
-    writeValue(0xF4);
-    stopCondition();
-    delay(500);
+    writeCommand(0x94, 0x16F4); // Command + signature
 }
 
 void stopCommandMode() {
@@ -149,7 +153,7 @@ void writeCommand(byte command, uint16_t value){
     startCondition();
     writeValue(command);
     writeValueBig(value);
-    startCondition();
+    stopCondition();
     delay(500);
 }
 
@@ -232,24 +236,19 @@ uint16_t extractCrcValue(const uint16_t *buffer) {
 }
 
 void extractSettings(const uint16_t *buffer, Settings &settings) {
-
     uint16_t clampLo = buffer[3] & CLAMP_LO_MASK;
     uint16_t clampHi = buffer[4] & CLAMP_HI_MASK;
-
     uint32_t angRngRawValue = ((buffer[1] & ANGLE_RANGE_MULTIPLIER_MSB_MASK) << ANGLE_RANGE_MULTIPLIER_MSB_SHIFT) | (buffer[2] & ANGLE_RANGE_MULTIPLIER_LSB_MASK);
     float angRngMultiplier = toFloat(angRngRawValue, ANGLE_RANGE_MULTIPLIER_POINT);
-
-    settings.mechanicalZeroAngle = toFloat(buffer[0], MECHANICAL_ZERO_ANGLE_POINT) * 180;
+    //settings.mechanicalZeroAngle = toFloat(buffer[0], MECHANICAL_ZERO_ANGLE_POINT) * 180;
+    settings.mechanicalZeroAngle = buffer[0] / (65536 / 180); // Don't understand the above... end up with 0 or nan
     settings.loVoltageClamp = clampLo / 5120.0f;
     settings.hiVoltageClamp = clampHi / 5120.0f;
     settings.mechanicalAngleRange = 180.0f / 8192 / angRngMultiplier * (clampHi - clampLo);
-
 }
 
 void readSensor(Settings &settings) {
-
     uint16_t values[8];
-
     for (int i = 0; i < 8; ++i) {
         byte command = (byte) (17 + i * 2);
         values[i] = readCommand(command);
@@ -262,7 +261,8 @@ void readSensor(Settings &settings) {
         extractSettings(values, settings);
         Serial.println();
         printSettings(settings);
-    } else {
+    } 
+    else {
         Serial.println();
         Serial.println("Readings not correct, print 'R' to retry");
         Serial.println();
@@ -294,7 +294,6 @@ void setLoVoltage(Settings &settings, float value) {
     printValue("Low output voltage set to ", " Vdd", settings.loVoltageClamp);
     Serial.println();
     printSettings(settings);
-
 }
 
 void setHighVoltage(Settings &settings, float value) {
@@ -304,20 +303,17 @@ void setHighVoltage(Settings &settings, float value) {
     printSettings(settings);
 }
 
-
 void writeSensorSettings(Settings &settings) {
-
     Serial.println("Writing preset to memory...");
     Serial.println();
-
     uint16_t clampLo = ((uint16_t) (settings.loVoltageClamp * 5120)) & CLAMP_LO_MASK;
     uint16_t clampHi = ((uint16_t) (settings.hiVoltageClamp * 5120)) & CLAMP_HI_MASK;
-    uint16_t mechanicalZeroAngle = toUnsignedInt(settings.mechanicalZeroAngle / 180, MECHANICAL_ZERO_ANGLE_POINT);
-    float angleRangeMultiplier = (clampHi - clampLo) / 8192.0f * 180 / settings.mechanicalAngleRange;
+    //uint16_t mechanicalZeroAngle = toUnsignedInt(settings.mechanicalZeroAngle / 180, MECHANICAL_ZERO_ANGLE_POINT);
+    uint16_t mechanicalZeroAngle = settings.mechanicalZeroAngle * (65536 / 180);  // Don't understand the above
+    float angleRangeMultiplier = ((clampHi - clampLo) / 8192.0f) * (180 / settings.mechanicalAngleRange);
     uint32_t rangeMultiplierValue = toUnsignedInt(angleRangeMultiplier, ANGLE_RANGE_MULTIPLIER_POINT);
-    float clampAngle = 0.5f * (1 + 1.0f / 8192 / angleRangeMultiplier * (clampHi - clampLo));
-    uint16_t clampAngleValue = (uint16_t) (clampAngle * 0x3ff);
-
+    float clampAngle = 0.5f * (1 + ((clampHi - clampLo) / 8192.0f) * (1.0f / angleRangeMultiplier));
+    uint16_t clampAngleValue = (uint16_t) (clampAngle * 0x3ff);      
     uint16_t buffer[8] = {
         mechanicalZeroAngle,
         (clampAngleValue << CLAMP_SW_ANGLE_SHIFT) | ((rangeMultiplierValue >> ANGLE_RANGE_MULTIPLIER_MSB_SHIFT) & ANGLE_RANGE_MULTIPLIER_MSB_MASK),
@@ -328,9 +324,10 @@ void writeSensorSettings(Settings &settings) {
         0,
         0
     };
-
+    startCommandMode();
+    writeCommand(0x96, WRITE_EN); // Enable write
+    writeCommand(0x82, CHRG_PMP); // Enable charge pump
     buffer[7] = 0 | (uint16_t) calcBufferCrc(buffer);
-
     for (int i = 0; i < 8; ++i) {
         byte command = (byte) (16 + i * 2);
         printWritingCommand(command);
@@ -338,8 +335,9 @@ void writeSensorSettings(Settings &settings) {
         writeCommand(command, buffer[i]);
         Serial.println();
     }
+    stopCommandMode();
+    Serial.println();
 }
-
 
 void initSettings(Settings &settings, float zeroAngle, float angleRange, float loVoltage, float hiVoltage) {
     settings.mechanicalZeroAngle = zeroAngle;
@@ -354,7 +352,6 @@ void setup() {
 }
 
 void loop() {
-    analogRead()
     if (Serial.available() > 0) {
         switch ((char) Serial.read()) {
             case 'R':
@@ -378,10 +375,12 @@ void loop() {
             case 'W':
                 writeSensorSettings(settings);
                 break;
+            case '\r': break;
+            case '\n': break;                
             default:
                 printHelp();
+                delay(5);
                 break;
         }
     }
 }
-
